@@ -1,0 +1,437 @@
+---
+title: "Follow-up analysis on proximity labeling of AGO2 interacting proteins"
+date: "August 8, 2017"
+output: 
+  pdf_document:
+    fig_caption: yes
+---
+```{r include=FALSE}
+# Step 1 - Set working directory
+setwd("C:/Users/Tony Lin/Desktop/Wiita Lab/Projects/Proteomics Project/BioID2-APEX-AGO2 Deniz/R script")
+
+
+# Step 2 - Read in protein groups CSV data file
+raw.data = read.csv("20170616 AGO2 BioID2 APEX Maxquant proteinGroups.csv", header = TRUE, colClasses = "character")
+
+
+# Step 3 - Data clean-up
+## Remove reverse proteins and contaminations
+data = raw.data
+data = data[data$Only.identified.by.site != "+", ]
+data = data[data$Reverse != "+", ]
+data = data[data$Potential.contaminant != "+", ]
+
+
+# Step 4 - Data-specific manipulations
+## Cast LFQ intensity columns as numeric type
+LFQ.names = grep("^LFQ", colnames(data), value = TRUE)
+data[, LFQ.names] = lapply(data[, LFQ.names], function(x) as.numeric(x))
+
+## Calculate log2(LFQ intensity)
+LOG.names = gsub("^LFQ.intensity", "LOG2", LFQ.names)
+data[, LOG.names] = lapply(data[, LFQ.names], function(x) log2(x))
+
+## Filter columns by names
+filter_cols = function(df, exp_grp) {
+  exp_grp.names = grep(exp_grp, colnames(df), value = TRUE)
+  LFQ.names = grep("^LFQ", exp_grp.names, value = TRUE)
+  IDtype.names = grep("^Identification.type", exp_grp.names, value = TRUE)
+  LOG2.names = grep("^LOG2", exp_grp.names, value = TRUE)
+  keepCols = c("Protein.IDs", "Protein.names", "Gene.names", "Number.of.proteins", 
+             "Peptides", LOG2.names, LFQ.names, IDtype.names)
+  return(df[, keepCols])
+}
+APEX.data = filter_cols(data, "APEX")
+BirA.data = filter_cols(data, "BirA")
+
+## Group filtering to remove -Inf values
+NA_filter = function(df, groupList = list("AGO2", "ctrl"), 
+                     min_number1 = 1, min_number2 = 0, impute = TRUE) {
+  # df = data frame containing log2 intensity data
+  # groupList = a list of vectors containing TWO groups
+  # min_number1 = filter out rows that do not meet the minimum number of valid values 
+  #       in group1
+  # min_number2 = filter out rows that do not meet the minimum number of valid values 
+  #       in group2
+  
+  #Count up all valid values in each group
+  validSum = lapply(groupList,
+                    function(group) {
+                      group.names = grep(paste0("LOG2.*", group), 
+                                         colnames(df), value = TRUE)
+                      return(apply(data.frame(df[, group.names]), 1, 
+                                          function(x) sum(x != -Inf)))
+                    })
+  
+  #Mark rows that do not pass the min_number filter
+  filter = apply(data.frame(validSum), 1, function(x) all(c(x[1] >= min_number1, x[2] >= min_number2)))
+  
+  return(df[filter, ])
+}
+APEX.data = NA_filter(APEX.data)
+BirA.data = NA_filter(BirA.data)
+
+## Impute missing data
+impute_data = function(df, width = 0.3, downshift = 1.8) {
+  # Assumes missing data (in df) follows a narrowed and downshifted normal distribution
+  LOG2.names = grep("^LOG2", colnames(df), value = TRUE)
+  impute.names = gsub("^LOG2", "impute", LOG2.names)
+  
+  # Create new columns indicating whether the values are imputed
+  df[, impute.names] = lapply(LOG2.names, function(x) is.infinite(df[, x]))
+  
+  # Imputation
+  set.seed(1)
+  df[, LOG2.names] = lapply(LOG2.names, 
+                            function(x) {
+                              temp = df[, x]
+                              temp[is.infinite(temp)] = NA
+                              temp.sd = width * sd(temp, na.rm = TRUE)
+                              temp.mean = mean(temp, na.rm = TRUE) - downshift * sd(temp, na.rm = TRUE)
+                              n.missing = sum(is.na(temp))
+                              temp[is.na(temp)] = sample(rnorm(n.missing, mean = temp.mean, sd = temp.sd),
+                                                         n.missing, replace = FALSE)
+                              return(temp)
+                            })
+  return(df)
+}
+APEX.data = impute_data(APEX.data)
+BirA.data = impute_data(BirA.data)
+
+## Calculate LOG2 difference (ONLY WORKS WHEN LENGTH OF groupList EQUALS 2)
+LOG2_diff = function(df, groupList = list("AGO2", "ctrl"), identifier = "") {
+  LOG2.names = grep("^LOG2", colnames(df), value = TRUE)
+  mean.names = paste0("mean.LOG2.", groupList, identifier)
+  df[, mean.names] = lapply(groupList, 
+                            function(x) {
+                              group.names = grep(x, LOG2.names, value = TRUE)
+                              return(rowMeans(data.frame(df[, group.names])))
+                            })
+  df[, paste0("diff.mean.LOG2", identifier)] = df[, mean.names[1]] - df[, mean.names[2]]
+  return(df)
+}
+APEX.data = LOG2_diff(APEX.data, identifier = ".APEX")
+BirA.data = LOG2_diff(BirA.data, identifier = ".BirA")
+
+## Merge APEX and BirA data to check for 
+merge.data = merge(APEX.data, BirA.data)
+mean.names = grep("mean", names(merge.data), value = TRUE)
+diff.names = grep("diff.mean", mean.names, value = TRUE)
+merge.data = cbind(merge.data[, 1:5], merge.data[, mean.names])
+merge.data[, "bothHigh"] = apply(merge.data[, diff.names], 1, function(x) all(x > 1))
+merge.data[, "bothLow"] = apply(merge.data[, diff.names], 1, function(x) all(x < -1))
+merge.data[, "bothUp"] = apply(merge.data[, diff.names], 1, function(x) all(x > 0))
+merge.data[, "bothDown"] = apply(merge.data[, diff.names], 1, function(x) all(x < 0))
+
+## List of AGO2 interactors from UniProt
+AGO2_interactors = c("DICER1", "TARBP2", "AGO1", "DDB1", "DDX5", "DDX6", "DDX20", "DHX30", 
+                     "DHX36", "DDX47", "DHX9", "ELAVL", "FXR1", "GEMIN4", "HNRNPF", "IGF2BP1", 
+                     "ILF3", "IMP8", "MATR3", "PABPC1", "PRMT5", "P4HA1", "P4HB", "RBM4", 
+                     "SART3", "TNRC6A", "TNRC6B", "UPF1", "YBX1", "DCP1A", "XRN1", "LIMD1", 
+                     "WTIP", "AJUBA", "TRIM71", "APOBEC3G", "APOBEC3A", "APOBEC3C", "APOBEC3F",
+                     "APOBEC3H", "EIF6", "MOV10", "RPL7A", "FMR1", "ZFP36", "CNOT1")
+is_interactor = function(df) {
+  AGO2.regex = paste0(rep("\\b", length(AGO2_interactors)), AGO2_interactors, 
+                      rep("\\b", length(AGO2_interactors))) #search string must be preceded and followed by nonwords
+  AGO2.index = sapply(AGO2.regex, grep, df$Gene.names)
+  AGO2.index = unique(unlist(AGO2.index))
+  df[, "is.interactor"] = 1:nrow(df) %in% AGO2.index
+  return(df)
+}
+BirA.data = is_interactor(BirA.data)
+APEX.data = is_interactor(APEX.data)
+merge.data = is_interactor(merge.data)
+
+## Logical vector to identify AGO2
+BirA.data$is.AGO2 = grepl("\\bAGO2\\b", BirA.data$Gene.names)
+APEX.data$is.AGO2 = grepl("\\bAGO2\\b", APEX.data$Gene.names)
+merge.data$is.AGO2 = grepl("\\bAGO2\\b", merge.data$Gene.names)
+
+## Modify data frame for ggplot
+require(scales)
+ggplot_format = function(df) {
+  colors = ifelse(df$is.interactor, "red", "black")
+  colors = ifelse(df$is.AGO2, "darkgreen", colors)
+  shades = ifelse(df$is.interactor, 1, 0.2)
+  shades = ifelse(df$is.AGO2, 1, shades)
+  df$colors = factor(alpha(colors, shades))
+  df$place.label = apply(df[, c("is.interactor", "is.AGO2")], 1, function(x) any(x))
+  return(df)
+}
+BirA.data = ggplot_format(BirA.data)
+APEX.data = ggplot_format(APEX.data)
+merge.data = ggplot_format(merge.data)
+```
+
+
+# Updates
+
+The stringency on filtering was loosened to accommodate more proteins in the analysis. We now require **ONLY ONE** quantification in the AGO2 group, allowing proteins without any measurements in the control to be included.
+
+
+# Results
+
+## Data Tables
+
+Added CNOT1 to the list of known candidates.
+
+\begin{table}[!h]
+\centering
+\caption{Summary statistics on the processed samples}
+\label{Table1}
+\begin{tabular}{ p{3cm} p{3cm} p{3cm} p{3cm} p{3cm} }
+\hline \\ [-1.5ex]
+Samples & \# protein groups identified & \# proteins after valid values filtering & \# missing values imputed & \% imputed out of total post-filter \\ [1ex]
+\hline \\ [-1.5ex]
+ctrl.APEX.bR01 & `r nrow(data)` & `r nrow(APEX.data)` & `r sum(APEX.data$impute.ctrl.APEX.bR01)` & `r round(sum(APEX.data$impute.ctrl.APEX.bR01)/nrow(APEX.data)*100, 1)`\\ [1ex]
+AGO2.APEX.bR01 & `r nrow(data)` & `r nrow(APEX.data)` & `r sum(APEX.data$impute.AGO2.APEX.bR01)` & `r round(sum(APEX.data$impute.AGO2.APEX.bR01)/nrow(APEX.data)*100, 1)`\\ [1ex]
+ctrl.BirA.bR01 & `r nrow(data)` & `r nrow(BirA.data)` & `r sum(BirA.data$impute.ctrl.BirA.bR01)` & `r round(sum(BirA.data$impute.ctrl.BirA.bR01)/nrow(BirA.data)*100, 1)`\\ [1ex]
+AGO2.BirA.bR01 & `r nrow(data)` & `r nrow(BirA.data)` & `r sum(BirA.data$impute.AGO2.BirA.bR01)` & `r round(sum(BirA.data$impute.AGO2.BirA.bR01)/nrow(BirA.data)*100, 1)`\\ [1ex]
+ctrl.BirA.bR02 & `r nrow(data)` & `r nrow(BirA.data)` & `r sum(BirA.data$impute.ctrl.BirA.bR02)` & `r round(sum(BirA.data$impute.ctrl.BirA.bR02)/nrow(BirA.data)*100, 1)`\\ [1ex]
+AGO2.BirA.bR02 & `r nrow(data)` & `r nrow(BirA.data)` & `r sum(BirA.data$impute.AGO2.BirA.bR02)` & `r round(sum(BirA.data$impute.AGO2.BirA.bR02)/nrow(BirA.data)*100, 1)`\\ [1ex]
+\hline
+\end{tabular}
+\end{table}
+
+
+\newpage
+## Data Exploration
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Histogram of logarithmized LFQ intensities by sample. \\label{Fig1}"}
+par(mfcol = c(2,3), mar = c(3,2,2,1))
+breakpts = seq(15, 35, 0.75)
+
+# APEX labeling
+hist(APEX.data$LOG2.ctrl.APEX.bR01, xlim = c(15, 35), ylim = c(0,200), main = "LOG2.ctrl.APEX.bR01", col = alpha("black", 0.4), breaks = breakpts)
+text(x = 30, y = 185, labels = paste0("n = ", length(APEX.data$LOG2.ctrl.APEX.bR01)))
+
+hist(APEX.data$LOG2.AGO2.APEX.bR01, xlim = c(15, 35), ylim = c(0,200), main = "LOG2.AGO2.APEX.bR01", col = alpha("black", 0.4), breaks = breakpts)
+text(x = 30, y = 185, labels = paste0("n =", length(APEX.data$LOG2.AGO2.APEX.bR01)))
+
+# BirA control bR01 labeling
+hist(BirA.data$LOG2.ctrl.BirA.bR01[BirA.data$impute.ctrl.BirA.bR01], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.ctrl.BirA.bR01", col = alpha("red", 0.4), breaks = breakpts)
+text(x = 30, y = 170, labels =paste0("n = ", length(BirA.data$LOG2.ctrl.BirA.bR01[BirA.data$impute.ctrl.BirA.bR01])), col = "red")
+hist(BirA.data$LOG2.ctrl.BirA.bR01[!BirA.data$impute.ctrl.BirA.bR01], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.ctrl.BirA.bR01", col = alpha("black", 0.4), add = TRUE, breaks = breakpts)
+text(x = 30, y = 185, labels =paste0("n = ", length(BirA.data$LOG2.ctrl.BirA.bR01[!BirA.data$impute.ctrl.BirA.bR01])), col = "black")
+
+# BirA-AGO2 bR01 labeling
+hist(BirA.data$LOG2.AGO2.BirA.bR01[BirA.data$impute.AGO2.BirA.bR01], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.AGO2.BirA.bR01", col = alpha("red", 0.4), breaks = breakpts)
+text(x = 30, y = 170, labels =paste0("n = ", length(BirA.data$LOG2.AGO2.BirA.bR01[BirA.data$impute.AGO2.BirA.bR01])), col = "red")
+hist(BirA.data$LOG2.AGO2.BirA.bR01[!BirA.data$impute.AGO2.BirA.bR01], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.AGO2.BirA.bR01", col = alpha("black", 0.4), add = TRUE, breaks = breakpts)
+text(x = 30, y = 185, labels =paste0("n = ", length(BirA.data$LOG2.AGO2.BirA.bR01[!BirA.data$impute.AGO2.BirA.bR01])), col = "black")
+
+# BirA control bR02 labeling
+hist(BirA.data$LOG2.ctrl.BirA.bR02[BirA.data$impute.ctrl.BirA.bR02], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.ctrl.BirA.bR02", col = alpha("red", 0.4), breaks = breakpts)
+text(x = 30, y = 170, labels =paste0("n = ", length(BirA.data$LOG2.ctrl.BirA.bR02[BirA.data$impute.ctrl.BirA.bR02])), col = "red")
+hist(BirA.data$LOG2.ctrl.BirA.bR02[!BirA.data$impute.ctrl.BirA.bR02], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.ctrl.BirA.bR02", col = alpha("black", 0.4), add = TRUE, breaks = breakpts)
+text(x = 30, y = 185, labels =paste0("n = ", length(BirA.data$LOG2.ctrl.BirA.bR02[!BirA.data$impute.ctrl.BirA.bR02])), col = "black")
+
+# BirA-AGO2 bR02 labeling
+hist(BirA.data$LOG2.AGO2.BirA.bR02[BirA.data$impute.AGO2.BirA.bR02], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.AGO2.BirA.bR02", col = alpha("red", 0.4), breaks = breakpts)
+text(x = 30, y = 170, labels =paste0("n = ", length(BirA.data$LOG2.AGO2.BirA.bR02[BirA.data$impute.AGO2.BirA.bR02])), col = "red")
+hist(BirA.data$LOG2.AGO2.BirA.bR02[!BirA.data$impute.AGO2.BirA.bR02], xlim = c(15, 35), ylim = c(0,200), main = "LOG2.AGO2.BirA.bR02", col = alpha("black", 0.4), add = TRUE, breaks = breakpts)
+text(x = 30, y = 185, labels =paste0("n = ", length(BirA.data$LOG2.AGO2.BirA.bR02[!BirA.data$impute.AGO2.BirA.bR02])), col = "black")
+```
+
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Correlation between APEX sample runs after data filtering. \\label{Fig2}", fig.height=3.4, fig.width=4, fig.pos="!h"}
+require(gpairs)
+# APEX
+gpairs(APEX.data[, grep("^LOG2", names(APEX.data), value = TRUE)],
+       upper.pars = list(scatter = "lm"),
+       scatter.pars = list(pch = 20,
+                           col = alpha("black", 0.3)),
+       lower.pars = list(scatter = "stats"),
+       stat.pars = list(verbose = FALSE, fontsize = 10))
+```
+
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Correlations between BirA sample runs after data filtering and imputation. \\label{Fig3}", fig.height=5.5, fig.width=6.5, fig.pos="!h"}
+# BirA
+gpairs(BirA.data[, grep("^LOG2", names(BirA.data), value = TRUE)],
+       upper.pars = list(scatter = "lm"),
+       scatter.pars = list(pch = 20,
+                           col = alpha("black", 0.3)),
+       lower.pars = list(scatter = "stats"),
+       stat.pars = list(verbose = FALSE, fontsize = 10))
+```
+
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Scatter plot of the mean log~2~ LFQ for proteins labeled in AGO2 vs control group. \\label{Fig4}", fig.pos="!h", fig.height=4}
+require(ggplot2)
+require(ggrepel)   # For labeling points
+
+reshape_data = function(df1, df2, df1.x, df1.y, df2.x, df2.y, 
+                        x.name, y.name, df1.name, df2.name, common.cols) {
+  x = c(df1[, df1.x], df2[, df2.x])
+  y = c(df1[, df1.y], df2[, df2.y])
+  name = c(rep(df1.name, nrow(df1)), rep(df2.name, nrow(df2)))
+  new.df = data.frame(x, y, name)
+  names(new.df) = c(x.name, y.name, "split")
+  new.df = cbind(new.df, rbind(df1[, common.cols], df2[, common.cols]))
+  return(new.df)
+}
+scatter.data = reshape_data(APEX.data, BirA.data, 
+                            "mean.LOG2.ctrl.APEX", "mean.LOG2.AGO2.APEX",
+                            "mean.LOG2.ctrl.BirA", "mean.LOG2.AGO2.BirA",
+                            "control", "AGO2.fusion",
+                            "APEX (single experiment)", "BirA (Two replicates)", common.cols = c("colors", "place.label", "Gene.names"))
+
+# ggplotting
+ggplot(scatter.data) +
+  geom_point(aes(control, AGO2.fusion, colour = colors)) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_text_repel(
+    data = subset(scatter.data, place.label),
+    aes(control, AGO2.fusion, label = Gene.names),
+    size = 3,
+    color = subset(scatter.data, place.label)$colors) +
+  facet_grid(. ~ split) +
+  scale_colour_manual(
+    name = "",
+    values = levels(scatter.data$colors),
+    labels = c("Proteins", "AGO2", "Known interactors")) +
+  scale_x_continuous(
+    name = expression("Control (log"[2]*" LFQ)"),
+    limits = c(15,35),
+    breaks = seq(15, 35, 5)) +
+  scale_y_continuous(
+    name = expression("AGO2-fused (log"[2]*" LFQ)"),
+    limits = c(15,35),
+    breaks = seq(15, 35, 5)) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Comparison of protein enrichment in APEX vs BirA labeling.  \\label{Fig5}", fig.height=4, fig.width=4}
+ggplot(merge.data) +
+  geom_point(aes(diff.mean.LOG2.BirA, diff.mean.LOG2.APEX, colour = colors)) +
+  geom_hline(yintercept = 0, color = "gray50", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "gray50", linetype = "dashed") +
+  geom_text_repel(
+    data = subset(merge.data, place.label),
+    aes(diff.mean.LOG2.BirA, diff.mean.LOG2.APEX, label = Gene.names),
+    size = 3,
+    color = subset(merge.data, place.label)$colors) +
+  scale_colour_manual(
+    name = "",
+    values = levels(merge.data$colors),
+    labels = c("Proteins", "AGO2", "Known interactors")) +
+  scale_x_continuous(
+    name = expression(" BirA log"[2]*"( fold change over control )"),
+    breaks = seq(-5, 15, 5), 
+    limits = c(-5, 15)) +
+  scale_y_continuous(
+    name = expression("APEX log"[2]*"( fold change over control )"),
+    breaks = seq(-5, 15, 5), 
+    limits = c(-5, 15)) +
+  annotate("text", x = -4, y = -5, label = paste0("n = ", sum(merge.data$diff.mean.LOG2.APEX < 0 &
+                                                                merge.data$diff.mean.LOG2.BirA < 0)), 
+                                                  size = 3, colour = "gray50") +
+  annotate("text", x = -4, y = 15, label = paste0("n = ", sum(merge.data$diff.mean.LOG2.APEX > 0 &
+                                                                merge.data$diff.mean.LOG2.BirA < 0)), 
+                                                  size = 3, colour = "gray50") +
+  annotate("text", x = 14, y = 15, label = paste0("n = ", sum(merge.data$diff.mean.LOG2.APEX > 0 &
+                                                                merge.data$diff.mean.LOG2.BirA > 0)), 
+                                                  size = 3, colour = "gray50") +
+  annotate("text", x = 14, y = -5, label = paste0("n = ", sum(merge.data$diff.mean.LOG2.APEX < 0 &
+                                                                merge.data$diff.mean.LOG2.BirA > 0)), 
+                                                  size = 3, colour = "gray50") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+
+\newpage
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Volcano plot of log~2~ LFQ differences between AGO2-BirA and BirA control labeling.  \\label{Fig6}"}
+volcano_plot = function(df, group1, group2, 
+                        color = "", lab.logical = "", labels = "",
+                        horiz = 1.3, vert = 1) {
+  # df = data frame containing proteomics intensity data
+  # group1 = df column names of biological replicates from condition 1
+  # group2 = df column names of biological replicates from condition 2
+  # color = OPTIONAL name of character column in df containing the color parameter
+  # lab.logical = OPTIONAL name of logical column in df (TRUE = label; FALSE = no label)
+  # labels = OPTIONAL name of character column containing point labels
+  # horiz = OPTIONAL draws a vertical line at the indicated y value (0 = no line)
+  # vert = OPTIONAL draws a horizontal line at the indicated x value (0 = no line)
+  # NOTE: t-test difference = mean(group1) - mean(group2)
+  
+  # Perform Welch's two-sided two-sample t-test
+  result = data.frame(Pvalue = numeric(0),
+                      difference = numeric(0))
+  for (i in 1:nrow(df)) {
+    stats = t.test(df[i, group1], df[i, group2], alternative = "two.sided", var.equal = F)
+    result[nrow(result) + 1, ] = c(stats[["p.value"]], 
+                                   -diff(stats[["estimate"]]))
+  }
+  result$LOG.Pvalue = -log10(result$Pvalue)
+  df = cbind(df, result)
+  
+  # Create plotting dataframe (ggplot only looks inside the given dataframe and the global environment)
+  plot.data = df
+  
+  ## Adjust color parameter
+  if(color == "") {
+    plot.data$color = rep("black", ncol(df))
+  } else {
+    plot.data$color = df[, color]
+  }
+  
+  ## Adjust labeling parameter
+  if(lab.logical == "") {
+    plot.data$lab.logical = rep(FALSE, ncol(df))
+  } else {
+    plot.data$lab.logical = df[, lab.logical]
+  }
+  
+  if(labels == "") {
+    plot.data$labels = character(ncol(df))
+  } else{
+    plot.data$labels = df[, labels]
+  }
+  
+  # Color significant
+  plot.data$is.significant = plot.data$Pvalue < 0.05 & plot.data$difference > 0 & plot.data$Gene.names != "AGO2" & !plot.data$is.interactor
+  plot.data$color = factor(ifelse(plot.data$is.significant, "cornflowerblue", as.character(plot.data$color)))
+  plot.data$lab.logical = ifelse(plot.data$is.significant, TRUE, plot.data$lab.logical)
+
+  # Create plot
+  print(
+    ggplot(plot.data) +
+      geom_point(aes(difference, LOG.Pvalue, colour = color)) +
+      geom_hline(yintercept = 1.301, color = "gray50", linetype = "dashed") + 
+      geom_vline(xintercept = 0, color = "gray50", linetype = "dashed") +
+      geom_text_repel(
+        data = subset(plot.data, lab.logical),
+        aes(difference, LOG.Pvalue, label = labels),
+        size = 3,
+        color = subset(plot.data, lab.logical)$color) +
+      scale_colour_manual(
+        name = "",
+        values = levels(plot.data$color),
+        labels = c("Proteins", "AGO2", "Known interactors", "Candidates")) +
+      scale_x_continuous(
+        name = expression("log"[2]*"( fold change in enrichment over control )"),
+                         breaks = seq(-4, 14, 2)) +
+      scale_y_continuous(name = expression("- log"[10]*"( P-value )")) +
+      annotate("text", x = 10, y = 1.25, label = "P-value = 0.05", size = 3, colour = "gray50") +
+      theme_classic() +
+      theme(legend.position = "bottom")
+  )
+  
+  # Returns data frame containing test statistics
+  return(df)
+}
+AGO2.BirA.group = grep("^LOG2.AGO2.BirA", names(BirA.data), value = TRUE)
+ctrl.BirA.group = grep("^LOG2.ctrl.BirA", names(BirA.data), value = TRUE)
+BirA.data = volcano_plot(BirA.data, group1 = AGO2.BirA.group, group2 = ctrl.BirA.group, color = "colors", lab.logical = "place.label", labels = "Gene.names")
+```
+
+
+
